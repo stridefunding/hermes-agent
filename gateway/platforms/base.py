@@ -2950,6 +2950,20 @@ class BasePlatformAdapter(ABC):
             # post-send block can schedule the deletion.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
 
+            # [dexter-local] NO_REPLY sentinel: when the model emits the exact
+            # token NO_REPLY (e.g. from a prompt rule like "in group threads,
+            # respond with NO_REPLY when you have nothing to add"), treat it
+            # as an explicit silent reply and skip delivery. Mirrors
+            # stevengonsalvez's proposal on NousResearch/hermes-agent#13248
+            # (2026-05-07). Three lines, zero impact when the token is absent.
+            if response and str(response).strip() == "NO_REPLY":
+                logger.info(
+                    "[%s] Agent returned NO_REPLY sentinel, skipping delivery for %s",
+                    self.name,
+                    event.source.chat_id,
+                )
+                response = None
+
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
             # when the message was queued behind an active agent.  Log at
