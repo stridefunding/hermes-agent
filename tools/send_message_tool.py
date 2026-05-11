@@ -21,13 +21,24 @@ logger = logging.getLogger(__name__)
 
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
-# Slack conversation IDs: C (public channel), G (private/group channel), D (DM).
-# Must be uppercase alphanumeric, 9+ chars. User IDs (U...) and workspace IDs
-# (W...) are NOT valid chat.postMessage channel values — posting to them fails
-# because the API requires a conversation ID. To DM a user you must first call
-# conversations.open to obtain a D... ID. Without this gate, Slack IDs fall
-# through to channel-name resolution, which only matches by name and fails.
-_SLACK_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,})\s*$")
+# Slack target IDs accepted by _parse_target_ref:
+#   C — public channel
+#   G — private/group channel
+#   D — DM channel
+#   U — user (DM is opened on demand via conversations.open in _send_slack)
+#   W — workspace user (same treatment as U)
+#
+# Upstream 75d3eaa0 narrowed this regex to [CGD] to stop silent retry loops
+# when callers passed U/W IDs that chat.postMessage rejects. That fix
+# eliminated the bad failure mode but left the "DM a user by U-id" use case
+# unsolved — the commit message explicitly notes "To DM a user you must
+# first call conversations.open to obtain a D... ID."
+#
+# This patch (dexter-local) completes that work: we accept U/W in the
+# explicit-target path, and _send_slack converts them to D-ids via
+# conversations.open before any chat.postMessage call. With the conversion
+# in place, U/W are valid send targets again.
+_SLACK_TARGET_RE = re.compile(r"^\s*([CGDUW][A-Z0-9]{8,})\s*$")
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
@@ -1141,6 +1152,54 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
         return _error(f"Discord send failed: {e}")
 
 
+_SLACK_U_TO_D_CACHE: dict[str, str] = {}
+
+
+async def _resolve_slack_user_to_dm(token: str, user_id: str) -> tuple[str, dict | None]:
+    """Convert a Slack U/W user id to a D-id by calling conversations.open.
+
+    Returns (d_id, None) on success or ("", error_dict) on failure.
+    Caches resolutions per-process — conversations.open returns the same
+    D-id deterministically for a given U-id, so re-asking is wasted RPC.
+    """
+    cached = _SLACK_U_TO_D_CACHE.get(user_id)
+    if cached:
+        return cached, None
+    try:
+        from slack_sdk.web.async_client import AsyncWebClient
+        from slack_sdk.errors import SlackApiError
+    except ImportError:
+        return "", {"error": "slack_sdk not installed. Run: pip install 'hermes-agent[slack]'"}
+    client = AsyncWebClient(token=token)
+    try:
+        from gateway.platforms.slack import (
+            _apply_slack_proxy,
+            _resolve_slack_proxy_url,
+        )
+        _proxy = _resolve_slack_proxy_url()
+        if _proxy:
+            _apply_slack_proxy(client, _proxy)
+    except ImportError:
+        pass
+    try:
+        resp = await client.conversations_open(users=[user_id])
+    except SlackApiError as exc:
+        err = None
+        r = getattr(exc, "response", None)
+        if r is not None:
+            try:
+                err = r.get("error")
+            except Exception:
+                err = None
+        return "", _error(f"Slack conversations.open error: {err or exc}")
+    try:
+        d_id = resp["channel"]["id"]
+    except (KeyError, TypeError):
+        return "", _error(f"Slack conversations.open: unexpected response shape for user {user_id}")
+    _SLACK_U_TO_D_CACHE[user_id] = d_id
+    return d_id, None
+
+
 async def _send_slack(token, chat_id, message, media_files=None, thread_id=None):
     """Send via Slack Web API.
 
@@ -1150,12 +1209,24 @@ async def _send_slack(token, chat_id, message, media_files=None, thread_id=None)
     send_document) so that cross-channel and DM sends through the
     ``send_message`` tool deliver attachments natively instead of dropping
     them with the "MEDIA attachments were omitted" warning.
+
+    If ``chat_id`` is a U/W user id, the function first opens a DM via
+    conversations.open (cached per-process) and uses the resulting D-id
+    as the channel — this completes upstream commit 75d3eaa0, which
+    narrowed the target regex to stop silent retries but did not add the
+    promised conversations.open call.
     """
     media_files = media_files or []
     try:
         import aiohttp
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+
+    if chat_id and chat_id[:1] in ("U", "W"):
+        d_id, err = await _resolve_slack_user_to_dm(token, chat_id)
+        if err:
+            return err
+        chat_id = d_id
 
     if media_files:
         try:

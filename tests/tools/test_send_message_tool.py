@@ -932,13 +932,15 @@ class TestParseTargetRefSlack:
     def test_dm_id_is_explicit(self):
         assert _parse_target_ref("slack", "D123ABCDEF")[2] is True
 
-    def test_user_id_is_not_explicit(self):
-        """Slack user IDs (U...) and workspace IDs (W...) are NOT explicit send
-        targets. chat.postMessage rejects them — a DM must be opened first via
-        conversations.open to obtain a D... conversation ID.
+    def test_user_id_is_explicit(self):
+        """Slack user IDs (U...) and workspace IDs (W...) ARE explicit send
+        targets again on this fork. _send_slack opens a DM via
+        conversations.open (cached) before any chat.postMessage call —
+        completes upstream 75d3eaa0 which narrowed the regex but did not
+        add the promised conversations.open conversion.
         """
-        assert _parse_target_ref("slack", "U123ABCDEF")[2] is False
-        assert _parse_target_ref("slack", "W123ABCDEF")[2] is False
+        assert _parse_target_ref("slack", "U123ABCDEF")[2] is True
+        assert _parse_target_ref("slack", "W123ABCDEF")[2] is True
 
     def test_whitespace_is_stripped(self):
         chat_id, _, is_explicit = _parse_target_ref("slack", "  C0B0QV5434G  ")
@@ -2756,3 +2758,241 @@ class TestSendToPlatformSlackMedia:
         assert warnings, "expected a 'MEDIA attachments were omitted' warning"
         # The warning text must mention slack now that we support it.
         assert "slack" in warnings[0]
+
+
+# ---------------------------------------------------------------------------
+# [dexter-local] U/W user-id DM resolution via conversations.open
+# (completes upstream 75d3eaa0)
+# ---------------------------------------------------------------------------
+
+
+class TestSlackUserIdToDmResolution:
+    """_send_slack opens a DM via conversations.open when chat_id is U/W."""
+
+    def _install_slack_sdk_mock(self, monkeypatch, conversations_open_mock, post_text_mock=None):
+        slack_sdk = MagicMock()
+
+        class FakeAsyncWebClient:
+            def __init__(self, token=None):
+                self.token = token
+                self.conversations_open = conversations_open_mock
+                self.files_upload_v2 = AsyncMock()
+
+        slack_sdk.web.async_client.AsyncWebClient = FakeAsyncWebClient
+
+        class FakeSlackApiError(Exception):
+            def __init__(self, message="", response=None):
+                super().__init__(message)
+                self.response = response
+
+        slack_sdk.errors.SlackApiError = FakeSlackApiError
+        monkeypatch.setitem(sys.modules, "slack_sdk", slack_sdk)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web", slack_sdk.web)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web.async_client", slack_sdk.web.async_client)
+        monkeypatch.setitem(sys.modules, "slack_sdk.errors", slack_sdk.errors)
+        return FakeAsyncWebClient, FakeSlackApiError
+
+    def _clear_cache(self):
+        from tools.send_message_tool import _SLACK_U_TO_D_CACHE
+        _SLACK_U_TO_D_CACHE.clear()
+
+    def test_u_id_target_opens_dm_before_post(self, monkeypatch):
+        """U-id target → conversations.open is called → chat.postMessage uses the returned D-id."""
+        self._clear_cache()
+        from tools.send_message_tool import _send_slack
+
+        conv_open = AsyncMock(return_value={"channel": {"id": "D9999OPENED"}})
+        self._install_slack_sdk_mock(monkeypatch, conv_open)
+
+        # chat.postMessage path uses aiohttp directly — capture the payload.
+        captured = {}
+
+        class _FakeResp:
+            async def json(self):
+                return {"ok": True, "ts": "1700.0001"}
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        class _FakeSession:
+            def __init__(self, *a, **kw):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            def post(self, url, headers=None, json=None, **kw):
+                captured["url"] = url
+                captured["payload"] = json
+                return _FakeResp()
+
+        monkeypatch.setattr("aiohttp.ClientSession", _FakeSession)
+
+        result = asyncio.run(_send_slack("xoxb-tok", "UJORDAN123", "hi"))
+        assert result["success"] is True
+        # Conversation was opened with the original U-id.
+        conv_open.assert_awaited_once_with(users=["UJORDAN123"])
+        # The actual chat.postMessage call used the D-id that conversations.open returned.
+        assert captured["payload"]["channel"] == "D9999OPENED"
+        assert captured["payload"]["text"] == "hi"
+
+    def test_w_id_target_also_opens_dm(self, monkeypatch):
+        """W-prefixed (workspace user) IDs are treated like U-ids."""
+        self._clear_cache()
+        from tools.send_message_tool import _send_slack
+
+        conv_open = AsyncMock(return_value={"channel": {"id": "D0000FROMW"}})
+        self._install_slack_sdk_mock(monkeypatch, conv_open)
+
+        class _FakeResp:
+            async def json(self):
+                return {"ok": True, "ts": "1700.0002"}
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        class _FakeSession:
+            def __init__(self, *a, **kw):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            def post(self, *a, **kw):
+                return _FakeResp()
+
+        monkeypatch.setattr("aiohttp.ClientSession", _FakeSession)
+        result = asyncio.run(_send_slack("xoxb-tok", "WORG12345", "ping"))
+        assert result["success"] is True
+        conv_open.assert_awaited_once_with(users=["WORG12345"])
+
+    def test_d_id_target_does_not_call_conversations_open(self, monkeypatch):
+        """Existing D-ids must not trigger an extra conversations.open RPC."""
+        self._clear_cache()
+        from tools.send_message_tool import _send_slack
+
+        conv_open = AsyncMock(return_value={"channel": {"id": "DSHOULDNOTBEUSED"}})
+        self._install_slack_sdk_mock(monkeypatch, conv_open)
+
+        class _FakeResp:
+            async def json(self):
+                return {"ok": True, "ts": "1700.0003"}
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        captured = {}
+
+        class _FakeSession:
+            def __init__(self, *a, **kw):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            def post(self, url, headers=None, json=None, **kw):
+                captured["payload"] = json
+                return _FakeResp()
+
+        monkeypatch.setattr("aiohttp.ClientSession", _FakeSession)
+        result = asyncio.run(_send_slack("xoxb-tok", "DABCDEF123", "direct"))
+        assert result["success"] is True
+        assert conv_open.await_count == 0
+        assert captured["payload"]["channel"] == "DABCDEF123"
+
+    def test_c_id_target_does_not_call_conversations_open(self, monkeypatch):
+        """Channel IDs (C...) must skip conversations.open entirely."""
+        self._clear_cache()
+        from tools.send_message_tool import _send_slack
+
+        conv_open = AsyncMock(return_value={"channel": {"id": "DSHOULDNOTBEUSED"}})
+        self._install_slack_sdk_mock(monkeypatch, conv_open)
+
+        class _FakeResp:
+            async def json(self):
+                return {"ok": True, "ts": "1700.0004"}
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        class _FakeSession:
+            def __init__(self, *a, **kw):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            def post(self, *a, **kw):
+                return _FakeResp()
+
+        monkeypatch.setattr("aiohttp.ClientSession", _FakeSession)
+        asyncio.run(_send_slack("xoxb-tok", "C1234CHANNEL", "channel post"))
+        assert conv_open.await_count == 0
+
+    def test_u_to_d_resolution_is_cached(self, monkeypatch):
+        """Second send to the same U-id reuses the cached D-id (no second conversations.open)."""
+        self._clear_cache()
+        from tools.send_message_tool import _send_slack
+
+        conv_open = AsyncMock(return_value={"channel": {"id": "DCACHED01"}})
+        self._install_slack_sdk_mock(monkeypatch, conv_open)
+
+        class _FakeResp:
+            async def json(self):
+                return {"ok": True, "ts": "x"}
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        class _FakeSession:
+            def __init__(self, *a, **kw):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            def post(self, *a, **kw):
+                return _FakeResp()
+
+        monkeypatch.setattr("aiohttp.ClientSession", _FakeSession)
+
+        asyncio.run(_send_slack("xoxb-tok", "UREPEAT123", "first"))
+        asyncio.run(_send_slack("xoxb-tok", "UREPEAT123", "second"))
+        assert conv_open.await_count == 1  # cache hit on the second call
+
+    def test_conversations_open_api_error_surfaces(self, monkeypatch):
+        """A SlackApiError on conversations.open returns a clean error, no postMessage attempted."""
+        self._clear_cache()
+        from tools.send_message_tool import _send_slack
+
+        # Build a fake error response with an .get('error') hook.
+        class _FakeResp:
+            def get(self, key, default=None):
+                return {"error": "user_not_found"}.get(key, default)
+
+        _, FakeSlackApiError = self._install_slack_sdk_mock(
+            monkeypatch,
+            AsyncMock(side_effect=None),
+        )
+        # Reinstall conversations_open to raise.
+        slack_sdk = sys.modules["slack_sdk"]
+        # Re-patch the FakeAsyncWebClient.conversations_open to raise.
+        client_factory = slack_sdk.web.async_client.AsyncWebClient
+        original_init = client_factory.__init__
+
+        def _init(self, token=None):
+            original_init(self, token=token)
+            self.conversations_open = AsyncMock(
+                side_effect=FakeSlackApiError("nope", response=_FakeResp())
+            )
+
+        client_factory.__init__ = _init
+
+        result = asyncio.run(_send_slack("xoxb-tok", "UBADUSER1", "hi"))
+        assert "error" in result
+        assert "user_not_found" in result["error"]
