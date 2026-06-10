@@ -127,6 +127,14 @@ def _make_config():
     ), telegram_cfg
 
 
+def _make_slack_config():
+    slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})
+    return SimpleNamespace(
+        platforms={Platform.SLACK: slack_cfg},
+        get_home_channel=lambda _platform: None,
+    ), slack_cfg
+
+
 def _install_telegram_mock(monkeypatch, bot):
     parse_mode = SimpleNamespace(MARKDOWN_V2="MarkdownV2", HTML="HTML")
     constants_mod = SimpleNamespace(ParseMode=parse_mode)
@@ -637,7 +645,7 @@ class TestSendToPlatformChunking:
             "***",
             "C123",
             "*hello* from <https://example.com|Hermes>",
-            thread_ts=None,
+            thread_id=None,
         )
 
     def test_slack_bold_italic_formatted_before_send(self, monkeypatch):
@@ -1245,13 +1253,10 @@ class TestParseTargetRefSlack:
     def test_dm_id_is_explicit(self):
         assert _parse_target_ref("slack", "D123ABCDEF")[2] is True
 
-    def test_user_id_is_not_explicit(self):
-        """Slack user IDs (U...) and workspace IDs (W...) are NOT explicit send
-        targets. chat.postMessage rejects them — a DM must be opened first via
-        conversations.open to obtain a D... conversation ID.
-        """
-        assert _parse_target_ref("slack", "U123ABCDEF")[2] is False
-        assert _parse_target_ref("slack", "W123ABCDEF")[2] is False
+    def test_user_id_is_explicit(self):
+        """Slack U/W user IDs are explicit targets; _send_slack opens the DM."""
+        assert _parse_target_ref("slack", "U123ABCDEF")[2] is True
+        assert _parse_target_ref("slack", "W123ABCDEF")[2] is True
 
     def test_whitespace_is_stripped(self):
         chat_id, _, is_explicit = _parse_target_ref("slack", "  C0B0QV5434G  ")
@@ -1301,7 +1306,12 @@ class TestParseTargetRefEmail:
     def test_email_not_explicit_for_other_platforms(self):
         assert _parse_target_ref("telegram", "user@example.com")[2] is False
         assert _parse_target_ref("discord", "user@example.com")[2] is False
-        assert _parse_target_ref("slack", "user@example.com")[2] is False
+
+    def test_email_is_user_lookup_for_slack(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("slack", "user@example.com")
+        assert chat_id.startswith("__slack_user_lookup__:email:")
+        assert thread_id is None
+        assert is_explicit is True
 
 
 class TestEmailHomeChannelErrorHint:
@@ -2846,3 +2856,875 @@ class TestSendTelegramThreadNotFoundRetry:
         finally:
             if media_path and os.path.exists(media_path):
                 os.unlink(media_path)
+
+# ---------------------------------------------------------------------------
+# Slack user lookup targets through send_message
+# ---------------------------------------------------------------------------
+
+
+class TestSendMessageSlackUserTargets:
+    """send_message resolves Slack email/name targets before delivery."""
+
+    def test_slack_email_target_resolves_user_before_send(self, tmp_path):
+        config, slack_cfg = _make_slack_config()
+        pdf = tmp_path / "portal_release_report.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+        resolver = AsyncMock(return_value=("U123TEST01", None))
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._resolve_slack_lookup_target", resolver), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "slack:email:recipient@example.test",
+                        "message": f"Forwarding the report.\nMEDIA:{pdf}",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        resolver.assert_awaited_once()
+        send_mock.assert_awaited_once_with(
+            Platform.SLACK,
+            slack_cfg,
+            "U123TEST01",
+            "Forwarding the report.",
+            thread_id=None,
+            media_files=[(str(pdf), False)],
+            force_document=False,
+        )
+
+    def test_slack_name_target_falls_back_to_user_lookup_after_channel_miss(self):
+        config, slack_cfg = _make_slack_config()
+        resolver = AsyncMock(return_value=("U123TEST01", None))
+
+        with patch("gateway.channel_directory.resolve_channel_name", return_value=None), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._resolve_slack_lookup_target", resolver), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "slack:Example Recipient",
+                        "message": "Heads up.",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        resolver.assert_awaited_once()
+        send_mock.assert_awaited_once_with(
+            Platform.SLACK,
+            slack_cfg,
+            "U123TEST01",
+            "Heads up.",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_slack_ambiguous_user_lookup_stops_before_send(self):
+        config, _slack_cfg = _make_slack_config()
+        resolver = AsyncMock(return_value=("", {"error": "Ambiguous Slack user target 'Example'"}))
+
+        with patch("gateway.channel_directory.resolve_channel_name", return_value=None), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._resolve_slack_lookup_target", resolver), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "slack:Example",
+                        "message": "Heads up.",
+                    }
+                )
+            )
+
+        assert "error" in result
+        assert "Ambiguous Slack user" in result["error"]
+        resolver.assert_awaited_once()
+        send_mock.assert_not_awaited()
+
+# ---------------------------------------------------------------------------
+# Slack media uploads on send_message
+# ---------------------------------------------------------------------------
+
+
+class TestSendSlackMedia:
+    """`_send_slack` uploads files via slack_sdk's files_upload_v2 when given media."""
+
+    def _install_slack_sdk_mock(self, monkeypatch, upload_mock):
+        """Inject a MagicMock slack_sdk.web.async_client + slack_sdk.errors."""
+        slack_sdk = MagicMock()
+
+        class FakeAsyncWebClient:
+            def __init__(self, token=None):
+                self.token = token
+                self.files_upload_v2 = upload_mock
+
+        slack_sdk.web.async_client.AsyncWebClient = FakeAsyncWebClient
+
+        class FakeSlackApiError(Exception):
+            def __init__(self, message="", response=None):
+                super().__init__(message)
+                self.response = response
+
+        slack_sdk.errors.SlackApiError = FakeSlackApiError
+
+        monkeypatch.setitem(sys.modules, "slack_sdk", slack_sdk)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web", slack_sdk.web)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web.async_client", slack_sdk.web.async_client)
+        monkeypatch.setitem(sys.modules, "slack_sdk.errors", slack_sdk.errors)
+        return FakeAsyncWebClient, FakeSlackApiError
+
+    def test_single_image_upload_uses_files_upload_v2(self, monkeypatch, tmp_path):
+        from tools.send_message_tool import _send_slack
+
+        img = tmp_path / "photo.png"
+        img.write_bytes(b"fake png content")
+
+        upload = AsyncMock(return_value={
+            "ok": True,
+            "files": [{"id": "F12345", "name": "photo.png"}],
+        })
+        self._install_slack_sdk_mock(monkeypatch, upload)
+
+        result = asyncio.run(
+            _send_slack("xoxb-tok", "C123", "here you go", media_files=[(str(img), False)])
+        )
+
+        assert result["success"] is True
+        assert result["platform"] == "slack"
+        assert result["chat_id"] == "C123"
+        assert result["message_id"] == "F12345"
+        upload.assert_awaited_once()
+        kwargs = upload.await_args.kwargs
+        assert kwargs["channel"] == "C123"
+        assert kwargs["file"] == str(img)
+        assert kwargs["filename"] == "photo.png"
+        # Caption must be carried into the upload as initial_comment, otherwise
+        # the user's text is dropped.
+        assert kwargs["initial_comment"] == "here you go"
+        # No thread_id was passed → no thread_ts kwarg should appear.
+        assert "thread_ts" not in kwargs
+
+    def test_thread_id_is_forwarded_as_thread_ts(self, monkeypatch, tmp_path):
+        from tools.send_message_tool import _send_slack
+
+        doc = tmp_path / "report.pdf"
+        doc.write_bytes(b"%PDF-1.4 fake")
+
+        upload = AsyncMock(return_value={"ok": True, "files": [{"id": "F1"}]})
+        self._install_slack_sdk_mock(monkeypatch, upload)
+
+        result = asyncio.run(
+            _send_slack(
+                "xoxb-tok", "C99", "see attached",
+                media_files=[(str(doc), False)],
+                thread_id="1700000000.000123",
+            )
+        )
+
+        assert result["success"] is True
+        kwargs = upload.await_args.kwargs
+        assert kwargs["thread_ts"] == "1700000000.000123"
+
+    def test_multiple_files_only_first_carries_caption(self, monkeypatch, tmp_path):
+        """Caption is attached to the first upload only — subsequent uploads
+        in the same call must not duplicate it as their initial_comment."""
+        from tools.send_message_tool import _send_slack
+
+        a = tmp_path / "a.png"
+        a.write_bytes(b"a")
+        b = tmp_path / "b.pdf"
+        b.write_bytes(b"%PDF b")
+
+        upload = AsyncMock(return_value={"ok": True, "files": [{"id": "F"}]})
+        self._install_slack_sdk_mock(monkeypatch, upload)
+
+        result = asyncio.run(
+            _send_slack(
+                "tok", "C1", "summary",
+                media_files=[(str(a), False), (str(b), False)],
+            )
+        )
+
+        assert result["success"] is True
+        assert upload.await_count == 2
+        first_kwargs = upload.await_args_list[0].kwargs
+        second_kwargs = upload.await_args_list[1].kwargs
+        assert first_kwargs["initial_comment"] == "summary"
+        assert second_kwargs["initial_comment"] == ""
+
+    def test_missing_media_file_returns_error(self, monkeypatch, tmp_path):
+        from tools.send_message_tool import _send_slack
+
+        upload = AsyncMock()
+        self._install_slack_sdk_mock(monkeypatch, upload)
+
+        result = asyncio.run(
+            _send_slack("tok", "C1", "msg", media_files=[(str(tmp_path / "missing.png"), False)])
+        )
+        assert "error" in result
+        assert "Media file not found" in result["error"]
+        upload.assert_not_awaited()
+
+    def test_slack_api_error_is_surfaced(self, monkeypatch, tmp_path):
+        """SlackApiError from the SDK must surface as a structured error, not an exception."""
+        from tools.send_message_tool import _send_slack
+
+        img = tmp_path / "x.png"
+        img.write_bytes(b"x")
+
+        # Configure the mock to raise SlackApiError on the first call.
+        # The error class is also returned from _install so we can construct it.
+        upload = AsyncMock()
+        _, FakeSlackApiError = self._install_slack_sdk_mock(monkeypatch, upload)
+
+        class FakeResp(dict):
+            pass
+
+        upload.side_effect = FakeSlackApiError(
+            "channel_not_found", response=FakeResp(error="channel_not_found")
+        )
+
+        result = asyncio.run(
+            _send_slack("tok", "Cbad", "hi", media_files=[(str(img), False)])
+        )
+
+        assert "error" in result
+        assert "channel_not_found" in result["error"]
+
+    def test_proxy_resolved_via_slack_helpers_is_applied_to_client(self, monkeypatch, tmp_path):
+        """Media path must apply SlackAdapter._resolve_slack_proxy_url to the
+        AsyncWebClient (regression for Copilot finding on the original PR —
+        without this, uploads fail in proxied environments while text-only
+        chat.postMessage works because aiohttp uses resolve_proxy_url())."""
+        from tools.send_message_tool import _send_slack
+
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"x")
+
+        # Capture the AsyncWebClient instance so we can inspect proxy state.
+        captured_clients = []
+        upload = AsyncMock(return_value={"ok": True, "files": [{"id": "F1"}]})
+
+        class FakeAsyncWebClient:
+            def __init__(self, token=None):
+                self.token = token
+                self.proxy = None  # SlackAdapter sets via .proxy attribute
+                self.files_upload_v2 = upload
+                captured_clients.append(self)
+
+        slack_sdk = MagicMock()
+        slack_sdk.web.async_client.AsyncWebClient = FakeAsyncWebClient
+
+        class FakeSlackApiError(Exception):
+            def __init__(self, message="", response=None):
+                super().__init__(message)
+                self.response = response
+
+        slack_sdk.errors.SlackApiError = FakeSlackApiError
+        monkeypatch.setitem(sys.modules, "slack_sdk", slack_sdk)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web", slack_sdk.web)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web.async_client", slack_sdk.web.async_client)
+        monkeypatch.setitem(sys.modules, "slack_sdk.errors", slack_sdk.errors)
+
+        # Force the SlackAdapter helpers to surface a proxy URL.
+        with patch("gateway.platforms.slack._resolve_slack_proxy_url", return_value="http://proxy.example:8080"):
+            result = asyncio.run(
+                _send_slack("xoxb", "C1", "hi", media_files=[(str(img), False)])
+            )
+
+        assert result["success"] is True
+        assert len(captured_clients) == 1
+        assert captured_clients[0].proxy == "http://proxy.example:8080"
+
+    def test_no_proxy_resolved_does_not_set_client_proxy(self, monkeypatch, tmp_path):
+        """When _resolve_slack_proxy_url returns None (no proxy / NO_PROXY hit),
+        the client's .proxy attribute must be left untouched (None), not coerced."""
+        from tools.send_message_tool import _send_slack
+
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"x")
+
+        captured_clients = []
+        upload = AsyncMock(return_value={"ok": True, "files": [{"id": "F1"}]})
+
+        class FakeAsyncWebClient:
+            def __init__(self, token=None):
+                self.token = token
+                self.proxy = "preset_sentinel"
+                self.files_upload_v2 = upload
+                captured_clients.append(self)
+
+        slack_sdk = MagicMock()
+        slack_sdk.web.async_client.AsyncWebClient = FakeAsyncWebClient
+
+        class FakeSlackApiError(Exception):
+            pass
+
+        slack_sdk.errors.SlackApiError = FakeSlackApiError
+        monkeypatch.setitem(sys.modules, "slack_sdk", slack_sdk)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web", slack_sdk.web)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web.async_client", slack_sdk.web.async_client)
+        monkeypatch.setitem(sys.modules, "slack_sdk.errors", slack_sdk.errors)
+
+        with patch("gateway.platforms.slack._resolve_slack_proxy_url", return_value=None):
+            result = asyncio.run(
+                _send_slack("xoxb", "C1", "hi", media_files=[(str(img), False)])
+            )
+
+        assert result["success"] is True
+        # Sentinel must remain untouched — _apply_slack_proxy was not called.
+        assert captured_clients[0].proxy == "preset_sentinel"
+
+    def test_text_only_path_does_not_import_slack_sdk(self, monkeypatch):
+        """Regression: text-only sends must continue to use aiohttp + chat.postMessage,
+        NOT touch slack_sdk. This guards against the new media branch leaking into
+        the text-only path."""
+        from tools.send_message_tool import _send_slack
+
+        # Purposely DO NOT install slack_sdk — if the text-only path tries to
+        # import it the test should still pass (proving the import is gated
+        # on media_files being truthy).
+        monkeypatch.delitem(sys.modules, "slack_sdk", raising=False)
+        monkeypatch.delitem(sys.modules, "slack_sdk.web", raising=False)
+        monkeypatch.delitem(sys.modules, "slack_sdk.web.async_client", raising=False)
+        monkeypatch.delitem(sys.modules, "slack_sdk.errors", raising=False)
+
+        # Stub the aiohttp.ClientSession so we don't actually hit Slack.
+        resp = MagicMock()
+        resp.json = AsyncMock(return_value={"ok": True, "ts": "111.222"})
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=None)
+        session = MagicMock()
+        session.post = MagicMock(return_value=resp)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = asyncio.run(_send_slack("tok", "C1", "just text"))
+
+        assert result["success"] is True
+        assert result["message_id"] == "111.222"
+        # slack_sdk must NOT have been imported by the text-only path.
+        assert "slack_sdk.web.async_client" not in sys.modules
+
+
+class TestSendToPlatformSlackMedia:
+    """`_send_to_platform` routes Slack media through the new media branch (#17261)."""
+
+    def test_media_present_uses_send_slack_with_media(self, monkeypatch, tmp_path):
+        """When media_files is non-empty for SLACK, _send_to_platform calls _send_slack
+        with media_files attached on the last chunk — not the warning-and-drop path."""
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"img")
+
+        send_mock = AsyncMock(return_value={
+            "success": True, "platform": "slack", "chat_id": "C42", "message_id": "F1",
+        })
+
+        with patch("tools.send_message_tool._send_slack", send_mock):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="xoxb", extra={}),
+                    "C42",
+                    "look",
+                    media_files=[(str(img), False)],
+                )
+            )
+
+        assert result["success"] is True
+        # The new media branch returns last_result directly — so the success
+        # path does NOT inject a "MEDIA attachments were omitted" warning.
+        assert "warnings" not in result
+        send_mock.assert_awaited_once()
+        kwargs = send_mock.await_args.kwargs
+        assert kwargs["media_files"] == [(str(img), False)]
+
+    def test_media_attaches_only_to_last_chunk(self, monkeypatch, tmp_path):
+        """Long Slack messages chunk to MAX_MESSAGE_LENGTH; media_files must
+        attach to the FINAL chunk only so we don't upload duplicates per-chunk."""
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"img")
+
+        # Slack MAX_MESSAGE_LENGTH is 39000 — build something well over that
+        # to force chunking through BasePlatformAdapter.truncate_message.
+        long_msg = ("word " * 9000).strip()
+        assert len(long_msg) > 39000
+
+        call_log = []
+
+        async def fake_send(token, chat_id, message, media_files=None, thread_id=None):
+            call_log.append(media_files or [])
+            return {
+                "success": True, "platform": "slack", "chat_id": chat_id,
+                "message_id": str(len(call_log)),
+            }
+
+        with patch("tools.send_message_tool._send_slack", fake_send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="xoxb", extra={}),
+                    "C7",
+                    long_msg,
+                    media_files=[(str(img), False)],
+                )
+            )
+
+        assert result["success"] is True
+        assert len(call_log) >= 2  # message was chunked
+        assert all(c == [] for c in call_log[:-1])
+        assert call_log[-1] == [(str(img), False)]
+
+    def test_text_only_slack_still_uses_text_branch(self, monkeypatch):
+        """Regression: a text-only Slack send (media_files empty) must NOT enter
+        the new media branch — it should hit the existing chat.postMessage path."""
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+
+        send_mock = AsyncMock(return_value={"success": True, "message_id": "1"})
+
+        with patch("tools.send_message_tool._send_slack", send_mock):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="xoxb", extra={}),
+                    "C1",
+                    "plain text",
+                    media_files=[],
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once()
+        # Text-only branch should not carry a media_files kwarg (that's the
+        # signal that distinguishes it from the new media branch). thread_id
+        # is allowed (it just defaults to None when not provided by caller).
+        called_kwargs = send_mock.await_args.kwargs
+        assert "media_files" not in called_kwargs
+
+    def test_text_only_slack_forwards_thread_id(self, monkeypatch):
+        """Text-only Slack sends must forward thread_id (regression for Copilot
+        finding on the original PR — without this, _send_to_platform's thread_id
+        is silently dropped for Slack unless media is present)."""
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+
+        send_mock = AsyncMock(return_value={"success": True, "message_id": "1"})
+
+        with patch("tools.send_message_tool._send_slack", send_mock):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="xoxb", extra={}),
+                    "C1",
+                    "thread reply",
+                    thread_id="1700000000.000999",
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once()
+        assert send_mock.await_args.kwargs.get("thread_id") == "1700000000.000999"
+
+    def test_warning_message_lists_slack_as_supported(self, monkeypatch):
+        """When media is dropped on a non-supporting platform, the warning text
+        must list slack as one of the supported platforms (regression for
+        https://github.com/NousResearch/hermes-agent/issues/17261)."""
+        # Pick a platform without media support, e.g. WHATSAPP.
+        _ensure_slack_mock(monkeypatch)
+
+        send_whatsapp = AsyncMock(return_value={"success": True, "message_id": "w1"})
+
+        with patch("tools.send_message_tool._send_whatsapp", send_whatsapp):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.WHATSAPP,
+                    SimpleNamespace(enabled=True, token="tok", extra={}),
+                    "1234567890",
+                    "with file please",
+                    media_files=[("/fake/x.png", False)],
+                )
+            )
+
+        assert result["success"] is True
+        warnings = result.get("warnings") or []
+        assert warnings, "expected a 'MEDIA attachments were omitted' warning"
+        # The warning text must mention slack now that we support it.
+        assert "slack" in warnings[0]
+
+
+# ---------------------------------------------------------------------------
+# Slack email/name target resolution for send_message
+# ---------------------------------------------------------------------------
+
+
+class TestSlackLookupTargets:
+    """Synthetic Slack lookup targets resolve to U-ids before DM opening."""
+
+    def _install_slack_sdk_mock(self, monkeypatch, lookup_mock=None, list_mock=None):
+        slack_sdk = MagicMock()
+
+        class FakeAsyncWebClient:
+            def __init__(self, token=None):
+                self.token = token
+                self.users_lookupByEmail = lookup_mock or AsyncMock()
+                self.users_list = list_mock or AsyncMock()
+
+        slack_sdk.web.async_client.AsyncWebClient = FakeAsyncWebClient
+
+        class FakeSlackApiError(Exception):
+            def __init__(self, message="", response=None):
+                super().__init__(message)
+                self.response = response
+
+        slack_sdk.errors.SlackApiError = FakeSlackApiError
+        monkeypatch.setitem(sys.modules, "slack_sdk", slack_sdk)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web", slack_sdk.web)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web.async_client", slack_sdk.web.async_client)
+        monkeypatch.setitem(sys.modules, "slack_sdk.errors", slack_sdk.errors)
+        return FakeSlackApiError
+
+    def test_email_lookup_uses_users_lookup_by_email(self, monkeypatch):
+        from tools.send_message_tool import _encode_slack_user_lookup, _resolve_slack_lookup_target
+
+        lookup = AsyncMock(return_value={"user": {"id": "U123TEST01"}})
+        self._install_slack_sdk_mock(monkeypatch, lookup_mock=lookup)
+
+        user_id, err = asyncio.run(
+            _resolve_slack_lookup_target(
+                "xoxb-test",
+                _encode_slack_user_lookup("email", "recipient@example.test"),
+            )
+        )
+
+        assert err is None
+        assert user_id == "U123TEST01"
+        lookup.assert_awaited_once_with(email="recipient@example.test")
+
+    def test_query_lookup_prefers_exact_active_human_match(self, monkeypatch):
+        from tools.send_message_tool import _encode_slack_user_lookup, _resolve_slack_lookup_target
+
+        users_list = AsyncMock(return_value={
+            "members": [
+                {
+                    "id": "UDELETED01",
+                    "deleted": True,
+                    "profile": {"real_name": "Example Recipient"},
+                },
+                {
+                    "id": "UBOT000001",
+                    "is_bot": True,
+                    "profile": {"real_name": "Example Recipient"},
+                },
+                {
+                    "id": "U123TEST01",
+                    "profile": {
+                        "real_name": "Example Recipient",
+                        "display_name": "example.recipient",
+                    },
+                },
+            ],
+            "response_metadata": {},
+        })
+        self._install_slack_sdk_mock(monkeypatch, list_mock=users_list)
+
+        user_id, err = asyncio.run(
+            _resolve_slack_lookup_target(
+                "xoxb-test",
+                _encode_slack_user_lookup("query", "Example Recipient"),
+            )
+        )
+
+        assert err is None
+        assert user_id == "U123TEST01"
+        users_list.assert_awaited_once_with(limit=200)
+
+    def test_query_lookup_reports_ambiguity(self, monkeypatch):
+        from tools.send_message_tool import _encode_slack_user_lookup, _resolve_slack_lookup_target
+
+        users_list = AsyncMock(return_value={
+            "members": [
+                {"id": "U111111111", "profile": {"real_name": "Example One"}},
+                {"id": "U222222222", "profile": {"real_name": "Example Two"}},
+            ],
+            "response_metadata": {},
+        })
+        self._install_slack_sdk_mock(monkeypatch, list_mock=users_list)
+
+        user_id, err = asyncio.run(
+            _resolve_slack_lookup_target(
+                "xoxb-test",
+                _encode_slack_user_lookup("query", "Example"),
+            )
+        )
+
+        assert user_id == ""
+        assert err is not None
+        assert "Ambiguous Slack user target" in err["error"]
+        assert "U111111111" in err["error"]
+        assert "U222222222" in err["error"]
+
+
+# ---------------------------------------------------------------------------
+# U/W user-id DM resolution via conversations.open
+# (completes upstream 75d3eaa0)
+# ---------------------------------------------------------------------------
+
+
+class TestSlackUserIdToDmResolution:
+    """_send_slack opens a DM via conversations.open when chat_id is U/W."""
+
+    def _install_slack_sdk_mock(self, monkeypatch, conversations_open_mock, post_text_mock=None):
+        slack_sdk = MagicMock()
+
+        class FakeAsyncWebClient:
+            def __init__(self, token=None):
+                self.token = token
+                self.conversations_open = conversations_open_mock
+                self.files_upload_v2 = AsyncMock()
+
+        slack_sdk.web.async_client.AsyncWebClient = FakeAsyncWebClient
+
+        class FakeSlackApiError(Exception):
+            def __init__(self, message="", response=None):
+                super().__init__(message)
+                self.response = response
+
+        slack_sdk.errors.SlackApiError = FakeSlackApiError
+        monkeypatch.setitem(sys.modules, "slack_sdk", slack_sdk)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web", slack_sdk.web)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web.async_client", slack_sdk.web.async_client)
+        monkeypatch.setitem(sys.modules, "slack_sdk.errors", slack_sdk.errors)
+        return FakeAsyncWebClient, FakeSlackApiError
+
+    def _clear_cache(self):
+        from tools.send_message_tool import _SLACK_U_TO_D_CACHE
+        _SLACK_U_TO_D_CACHE.clear()
+
+    def test_u_id_target_opens_dm_before_post(self, monkeypatch):
+        """U-id target → conversations.open is called → chat.postMessage uses the returned D-id."""
+        self._clear_cache()
+        from tools.send_message_tool import _send_slack
+
+        conv_open = AsyncMock(return_value={"channel": {"id": "D9999OPENED"}})
+        self._install_slack_sdk_mock(monkeypatch, conv_open)
+
+        # chat.postMessage path uses aiohttp directly — capture the payload.
+        captured = {}
+
+        class _FakeResp:
+            async def json(self):
+                return {"ok": True, "ts": "1700.0001"}
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        class _FakeSession:
+            def __init__(self, *a, **kw):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            def post(self, url, headers=None, json=None, **kw):
+                captured["url"] = url
+                captured["payload"] = json
+                return _FakeResp()
+
+        monkeypatch.setattr("aiohttp.ClientSession", _FakeSession)
+
+        result = asyncio.run(_send_slack("xoxb-tok", "UOPENED123", "hi"))
+        assert result["success"] is True
+        # Conversation was opened with the original U-id.
+        conv_open.assert_awaited_once_with(users=["UOPENED123"])
+        # The actual chat.postMessage call used the D-id that conversations.open returned.
+        assert captured["payload"]["channel"] == "D9999OPENED"
+        assert captured["payload"]["text"] == "hi"
+
+    def test_w_id_target_also_opens_dm(self, monkeypatch):
+        """W-prefixed (workspace user) IDs are treated like U-ids."""
+        self._clear_cache()
+        from tools.send_message_tool import _send_slack
+
+        conv_open = AsyncMock(return_value={"channel": {"id": "D0000FROMW"}})
+        self._install_slack_sdk_mock(monkeypatch, conv_open)
+
+        class _FakeResp:
+            async def json(self):
+                return {"ok": True, "ts": "1700.0002"}
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        class _FakeSession:
+            def __init__(self, *a, **kw):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            def post(self, *a, **kw):
+                return _FakeResp()
+
+        monkeypatch.setattr("aiohttp.ClientSession", _FakeSession)
+        result = asyncio.run(_send_slack("xoxb-tok", "WORG12345", "ping"))
+        assert result["success"] is True
+        conv_open.assert_awaited_once_with(users=["WORG12345"])
+
+    def test_d_id_target_does_not_call_conversations_open(self, monkeypatch):
+        """Existing D-ids must not trigger an extra conversations.open RPC."""
+        self._clear_cache()
+        from tools.send_message_tool import _send_slack
+
+        conv_open = AsyncMock(return_value={"channel": {"id": "DSHOULDNOTBEUSED"}})
+        self._install_slack_sdk_mock(monkeypatch, conv_open)
+
+        class _FakeResp:
+            async def json(self):
+                return {"ok": True, "ts": "1700.0003"}
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        captured = {}
+
+        class _FakeSession:
+            def __init__(self, *a, **kw):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            def post(self, url, headers=None, json=None, **kw):
+                captured["payload"] = json
+                return _FakeResp()
+
+        monkeypatch.setattr("aiohttp.ClientSession", _FakeSession)
+        result = asyncio.run(_send_slack("xoxb-tok", "DABCDEF123", "direct"))
+        assert result["success"] is True
+        assert conv_open.await_count == 0
+        assert captured["payload"]["channel"] == "DABCDEF123"
+
+    def test_c_id_target_does_not_call_conversations_open(self, monkeypatch):
+        """Channel IDs (C...) must skip conversations.open entirely."""
+        self._clear_cache()
+        from tools.send_message_tool import _send_slack
+
+        conv_open = AsyncMock(return_value={"channel": {"id": "DSHOULDNOTBEUSED"}})
+        self._install_slack_sdk_mock(monkeypatch, conv_open)
+
+        class _FakeResp:
+            async def json(self):
+                return {"ok": True, "ts": "1700.0004"}
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        class _FakeSession:
+            def __init__(self, *a, **kw):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            def post(self, *a, **kw):
+                return _FakeResp()
+
+        monkeypatch.setattr("aiohttp.ClientSession", _FakeSession)
+        asyncio.run(_send_slack("xoxb-tok", "C1234CHANNEL", "channel post"))
+        assert conv_open.await_count == 0
+
+    def test_u_to_d_resolution_is_cached(self, monkeypatch):
+        """Second send to the same U-id reuses the cached D-id (no second conversations.open)."""
+        self._clear_cache()
+        from tools.send_message_tool import _send_slack
+
+        conv_open = AsyncMock(return_value={"channel": {"id": "DCACHED01"}})
+        self._install_slack_sdk_mock(monkeypatch, conv_open)
+
+        class _FakeResp:
+            async def json(self):
+                return {"ok": True, "ts": "x"}
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        class _FakeSession:
+            def __init__(self, *a, **kw):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            def post(self, *a, **kw):
+                return _FakeResp()
+
+        monkeypatch.setattr("aiohttp.ClientSession", _FakeSession)
+
+        asyncio.run(_send_slack("xoxb-tok", "UREPEAT123", "first"))
+        asyncio.run(_send_slack("xoxb-tok", "UREPEAT123", "second"))
+        assert conv_open.await_count == 1  # cache hit on the second call
+
+    def test_conversations_open_api_error_surfaces(self, monkeypatch):
+        """A SlackApiError on conversations.open returns a clean error, no postMessage attempted."""
+        self._clear_cache()
+        from tools.send_message_tool import _send_slack
+
+        # Build a fake error response with an .get('error') hook.
+        class _FakeResp:
+            def get(self, key, default=None):
+                return {"error": "user_not_found"}.get(key, default)
+
+        _, FakeSlackApiError = self._install_slack_sdk_mock(
+            monkeypatch,
+            AsyncMock(side_effect=None),
+        )
+        # Reinstall conversations_open to raise.
+        slack_sdk = sys.modules["slack_sdk"]
+        # Re-patch the FakeAsyncWebClient.conversations_open to raise.
+        client_factory = slack_sdk.web.async_client.AsyncWebClient
+        original_init = client_factory.__init__
+
+        def _init(self, token=None):
+            original_init(self, token=token)
+            self.conversations_open = AsyncMock(
+                side_effect=FakeSlackApiError("nope", response=_FakeResp())
+            )
+
+        client_factory.__init__ = _init
+
+        result = asyncio.run(_send_slack("xoxb-tok", "UBADUSER1", "hi"))
+        assert "error" in result
+        assert "user_not_found" in result["error"]
