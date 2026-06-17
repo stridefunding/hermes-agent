@@ -79,6 +79,7 @@ def _build_full_manifest(bot_name: str, bot_description: str) -> dict:
                     "im:read",
                     "im:write",
                     "users:read",
+                    "users:read.email",
                 ],
             },
         },
