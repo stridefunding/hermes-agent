@@ -13,6 +13,7 @@ import contextvars
 import json
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -278,6 +279,44 @@ _SLACK_PROXY_HOSTS = (
     "wss-primary.slack.com",
 )
 
+_DEFAULT_ASSISTANT_STATUS = "is thinking..."
+
+
+def _coerce_assistant_status_messages(value: Any) -> List[str]:
+    """Normalize configured Slack assistant status messages."""
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                value = parsed
+            else:
+                value = raw.splitlines()
+        elif "\n" in raw:
+            value = raw.splitlines()
+        elif "|" in raw:
+            value = raw.split("|")
+        else:
+            value = [raw]
+
+    if not isinstance(value, (list, tuple)):
+        return []
+
+    messages: List[str] = []
+    for item in value:
+        text = str(item).strip()
+        if text:
+            messages.append(text[:80])
+    return messages
+
 
 def _resolve_slack_proxy_url() -> Optional[str]:
     """Resolve a proxy URL that Slack SDK clients can safely use."""
@@ -326,6 +365,14 @@ class SlackAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SLACK)
+        extra = config.extra or {}
+        status_messages = os.getenv("HERMES_SLACK_ASSISTANT_STATUS_MESSAGES")
+        if status_messages is None:
+            status_messages = extra.get("assistant_status_messages")
+        self._assistant_status_messages = (
+            _coerce_assistant_status_messages(status_messages)
+            or [_DEFAULT_ASSISTANT_STATUS]
+        )
         self._app: Optional[Any] = None
         self._handler: Optional[Any] = None
         self._bot_user_id: Optional[str] = None
@@ -1208,7 +1255,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Show a typing/status indicator using assistant.threads.setStatus.
 
-        Displays "is thinking..." next to the bot name in a thread.
+        Displays a short status next to the bot name in a thread.
         Requires the assistant:write or chat:write scope.
         Auto-clears when the bot sends a reply to the thread.
         """
@@ -1223,11 +1270,12 @@ class SlackAdapter(BasePlatformAdapter):
             return  # Can only set status in a thread context
 
         self._active_status_threads[chat_id] = thread_ts
+        status = random.choice(self._assistant_status_messages)
         try:
             await self._get_client(chat_id).assistant_threads_setStatus(
                 channel_id=chat_id,
                 thread_ts=thread_ts,
-                status="is thinking...",
+                status=status,
             )
         except Exception as e:
             # Silently ignore — may lack assistant:write scope or not be
