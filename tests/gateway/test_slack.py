@@ -1788,6 +1788,57 @@ class TestSendTyping:
         )
 
     @pytest.mark.asyncio
+    async def test_uses_configured_assistant_status_message(self, monkeypatch):
+        monkeypatch.setattr(_slack_mod.random, "choice", lambda messages: messages[-1])
+        config = PlatformConfig(
+            enabled=True,
+            token="xoxb-fake-token",
+            extra={
+                "assistant_status_messages": [
+                    "checking the purple wires...",
+                    "digging through the dumpster...",
+                ],
+            },
+        )
+        adapter = SlackAdapter(config)
+        adapter._app = MagicMock()
+        adapter._app.client = AsyncMock()
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+
+        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+
+        adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
+            channel_id="C123",
+            thread_ts="parent_ts",
+            status="digging through the dumpster...",
+        )
+
+    @pytest.mark.asyncio
+    async def test_env_assistant_status_messages_override_config(self, monkeypatch):
+        monkeypatch.setenv(
+            "HERMES_SLACK_ASSISTANT_STATUS_MESSAGES",
+            '["sorting clues...", "checking Slack smoke signals..."]',
+        )
+        monkeypatch.setattr(_slack_mod.random, "choice", lambda messages: messages[0])
+        config = PlatformConfig(
+            enabled=True,
+            token="xoxb-fake-token",
+            extra={"assistant_status_messages": ["config status"]},
+        )
+        adapter = SlackAdapter(config)
+        adapter._app = MagicMock()
+        adapter._app.client = AsyncMock()
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+
+        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+
+        adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
+            channel_id="C123",
+            thread_ts="parent_ts",
+            status="sorting clues...",
+        )
+
+    @pytest.mark.asyncio
     async def test_stop_typing_clears_tracked_thread(self, adapter):
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
         await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
