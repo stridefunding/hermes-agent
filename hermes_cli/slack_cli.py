@@ -79,6 +79,7 @@ def _build_full_manifest(
         "mpim:history",
         "mpim:read",
         "users:read",
+        "users:read.email",
     ]
 
     bot_events = [

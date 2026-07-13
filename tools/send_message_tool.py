@@ -21,14 +21,13 @@ logger = logging.getLogger(__name__)
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 # Slack conversation IDs: C (public channel), G (private/group channel), D (DM).
-# Must be uppercase alphanumeric, 9+ chars. User IDs (U...) and workspace IDs
-# (W...) are NOT valid chat.postMessage channel values — posting to them fails
-# because the API requires a conversation ID. To DM a user you must first call
-# conversations.open to obtain a D... ID. Without this gate, Slack IDs fall
-# through to channel-name resolution, which only matches by name and fails.
-_SLACK_TARGET_RE = re.compile(r"^\s*([CGDU][A-Z0-9]{8,})\s*$")
+# User IDs (U...) and workspace user IDs (W...) are accepted as explicit tool
+# targets and converted to D... DM channel IDs via conversations.open by the
+# slack plugin's standalone sender before chat.postMessage / files_upload_v2.
+_SLACK_TARGET_RE = re.compile(r"^\s*([CGDUW][A-Z0-9]{8,})\s*$")
 # Session-derived Slack thread targets use "<conversation_id>:<thread_ts>".
 _SLACK_THREAD_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,}):([^\s:]+)\s*$")
+_SLACK_LOOKUP_TARGET_PREFIX = "__slack_user_lookup__:"
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
@@ -145,6 +144,9 @@ SEND_MESSAGE_SCHEMA = {
         "IMPORTANT: When the user asks to send to a specific channel or person "
         "(not just a bare platform name), call send_message(action='list') FIRST to see "
         "available targets, then send to the correct one.\n"
+        "For Slack users who are not listed targets, you may send directly to "
+        "slack:U..., slack:email:user@example.com, slack:@handle, or "
+        "slack:user:Real Name; Hermes will resolve the user and open the DM.\n"
         "If the user just says a platform name like 'send to telegram', send directly "
         "to the home channel without listing first."
     ),
@@ -158,7 +160,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Slack also supports user targets: 'slack:U...', 'slack:email:user@example.com', 'slack:@handle', or 'slack:user:Real Name'. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'slack:email:recipient@example.test', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
             },
             "message": {
                 "type": "string",
@@ -320,16 +322,37 @@ def _handle_send(args):
             resolved = resolve_channel_name(platform_name, target_ref)
             if resolved:
                 chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+            elif platform_name == "slack":
+                lookup = _parse_slack_user_lookup_ref(target_ref, allow_bare=True)
+                if lookup:
+                    chat_id = _encode_slack_user_lookup(*lookup)
+                    thread_id = None
+                else:
+                    return json.dumps({
+                        "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+                        f"Use send_message(action='list') to see available targets."
+                    })
             else:
                 return json.dumps({
                     "error": f"Could not resolve '{target_ref}' on {platform_name}. "
                     f"Use send_message(action='list') to see available targets."
                 })
         except Exception:
-            return json.dumps({
-                "error": f"Could not resolve '{target_ref}' on {platform_name}. "
-                f"Try using a numeric channel ID instead."
-            })
+            if platform_name == "slack":
+                lookup = _parse_slack_user_lookup_ref(target_ref, allow_bare=True)
+                if lookup:
+                    chat_id = _encode_slack_user_lookup(*lookup)
+                    thread_id = None
+                else:
+                    return json.dumps({
+                        "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+                        f"Try using a channel/conversation ID, U-id, email, or @username instead."
+                    })
+            else:
+                return json.dumps({
+                    "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+                    f"Try using a numeric channel ID instead."
+                })
 
     from tools.interrupt import is_interrupted
     if is_interrupted():
@@ -371,6 +394,21 @@ def _handle_send(args):
         else:
             return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
 
+    # Slack: resolve a synthetic user-lookup target (email/name/handle) to a
+    # real U-id in the trusted tool process. The U-id then flows into the
+    # conversations.open U/W→D conversion below, exactly like an explicit U-id.
+    if platform_name == "slack" and chat_id and _is_slack_user_lookup(chat_id):
+        try:
+            from model_tools import _run_async
+            resolved_user_id, resolve_error = _run_async(
+                _resolve_slack_lookup_target(pconfig.token, chat_id)
+            )
+        except Exception as exc:
+            return json.dumps(_error(f"Slack user lookup failed: {exc}"))
+        if resolve_error:
+            return json.dumps(resolve_error)
+        chat_id = resolved_user_id
+
     from gateway.platforms.base import BasePlatformAdapter
 
     # Capture [[as_document]] directive before extract_media strips it.
@@ -408,8 +446,11 @@ def _handle_send(args):
     if duplicate_skip:
         return json.dumps(duplicate_skip)
 
-    # Slack: resolve user IDs (U...) to DM channel IDs via conversations.open
-    if platform_name == "slack" and chat_id and chat_id.startswith("U"):
+    # Slack: resolve user IDs (U.../W...) to DM channel IDs via
+    # conversations.open. Workspace user IDs (W...) are Enterprise Grid member
+    # IDs and open DMs the same way — chat.postMessage / files_upload_v2 both
+    # reject a raw U/W id, so a D... conversation must be opened first.
+    if platform_name == "slack" and chat_id and chat_id[:1] in ("U", "W"):
         try:
             import aiohttp
             async def _open_slack_dm(token, user_id):
@@ -499,14 +540,13 @@ def _parse_target_ref(platform_name: str, target_ref: str):
             return match.group(1), match.group(2), True
         match = _SLACK_TARGET_RE.fullmatch(target_ref)
         if match:
-            chat_id = match.group(1)
-            # Slack user IDs (U...) and workspace IDs (W...) are NOT valid
-            # explicit send targets — chat.postMessage rejects them. A DM
-            # must be opened first via conversations.open to get a D...
-            # conversation ID. Caller still gets the chat_id so the U→D
-            # resolution path in send_message() can run.
-            is_explicit = chat_id[0] not in {"U", "W"}
-            return chat_id, None, is_explicit
+            # C/G/D conversation IDs and U/W user IDs are all explicit targets.
+            # U/W ids are converted to a D... DM channel via conversations.open
+            # in _handle_send before chat.postMessage / files_upload_v2 run.
+            return match.group(1), None, True
+        lookup = _parse_slack_user_lookup_ref(target_ref, allow_bare=False)
+        if lookup:
+            return _encode_slack_user_lookup(*lookup), None, True
     if platform_name == "matrix":
         trimmed = target_ref.strip()
         split_idx = trimmed.rfind(":$")
@@ -558,6 +598,222 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     if platform_name == "xmpp" and "@" in target_ref:
         return target_ref, None, True
     return None, None, False
+
+
+def _parse_slack_user_lookup_ref(target_ref: str, *, allow_bare: bool) -> "tuple[str, str] | None":
+    """Return a Slack user lookup descriptor from a target fragment.
+
+    Supported explicit forms:
+      - ``slack:email:user@example.com``
+      - ``slack:mailto:user@example.com``
+      - ``slack:user:Example Recipient``
+      - ``slack:name:Example Recipient``
+      - ``slack:@example.recipient``
+
+    When ``allow_bare`` is true, a channel-directory miss like
+    ``slack:Example Recipient`` is treated as a user search. Bare refs that
+    look like channel names (``#engineering``) are left alone so errors stay
+    channel-oriented.
+    """
+    raw = (target_ref or "").strip()
+    if not raw:
+        return None
+
+    lowered = raw.lower()
+    for prefix in ("email:", "mailto:"):
+        if lowered.startswith(prefix):
+            value = raw[len(prefix):].strip()
+            if _EMAIL_TARGET_RE.fullmatch(value):
+                return "email", value
+            return None
+
+    if _EMAIL_TARGET_RE.fullmatch(raw):
+        return "email", raw
+
+    for prefix in ("user:", "name:"):
+        if lowered.startswith(prefix):
+            value = raw[len(prefix):].strip()
+            return ("query", value) if value else None
+
+    if raw.startswith("@"):
+        value = raw[1:].strip()
+        return ("query", value) if value else None
+
+    if allow_bare and not raw.startswith("#"):
+        return "query", raw
+
+    return None
+
+
+def _encode_slack_user_lookup(kind: str, value: str) -> str:
+    return f"{_SLACK_LOOKUP_TARGET_PREFIX}{kind}:{value}"
+
+
+def _is_slack_user_lookup(chat_id: str) -> bool:
+    return str(chat_id or "").startswith(_SLACK_LOOKUP_TARGET_PREFIX)
+
+
+def _decode_slack_user_lookup(chat_id: str) -> "tuple[str, str]":
+    payload = str(chat_id)[len(_SLACK_LOOKUP_TARGET_PREFIX):]
+    kind, value = payload.split(":", 1)
+    return kind, value
+
+
+def _format_slack_user_candidate(member: dict) -> str:
+    profile = member.get("profile") or {}
+    label = (
+        profile.get("real_name")
+        or profile.get("display_name")
+        or member.get("real_name")
+        or member.get("name")
+        or member.get("id")
+        or "unknown"
+    )
+    user_id = member.get("id") or "?"
+    handle = profile.get("display_name") or member.get("name") or ""
+    suffix = f" @{handle}" if handle and handle != label else ""
+    return f"{label}{suffix} ({user_id})"
+
+
+def _slack_user_match_fields(member: dict) -> "list[str]":
+    profile = member.get("profile") or {}
+    fields = [
+        member.get("name"),
+        member.get("real_name"),
+        profile.get("real_name"),
+        profile.get("display_name"),
+        profile.get("display_name_normalized"),
+        profile.get("real_name_normalized"),
+        profile.get("email"),
+    ]
+    return [str(field).strip() for field in fields if str(field or "").strip()]
+
+
+def _normalize_slack_user_query(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lstrip("@")).lower()
+
+
+async def _resolve_slack_lookup_target(token: str, lookup_chat_id: str) -> "tuple[str, dict | None]":
+    """Resolve a synthetic Slack lookup target to a Slack U-id.
+
+    ``send_message`` accepts human-facing target refs such as
+    ``slack:email:recipient@example.test`` and ``slack:@example.recipient``.
+    This resolver keeps the token/API work in the trusted tool process and
+    returns a normal U-id that the ``_handle_send`` U/W→D conversion can
+    deliver to.
+    """
+    try:
+        kind, query = _decode_slack_user_lookup(lookup_chat_id)
+    except Exception:
+        return "", _error(f"Invalid Slack user lookup target: {lookup_chat_id}")
+
+    try:
+        from slack_sdk.web.async_client import AsyncWebClient
+        from slack_sdk.errors import SlackApiError
+    except ImportError:
+        return "", {"error": "slack_sdk not installed. Run: pip install 'hermes-agent[slack]'"}
+
+    client = AsyncWebClient(token=token)
+    try:
+        from plugins.platforms.slack.adapter import (
+            _apply_slack_proxy,
+            _resolve_slack_proxy_url,
+        )
+        _proxy = _resolve_slack_proxy_url()
+        if _proxy:
+            _apply_slack_proxy(client, _proxy)
+    except ImportError:
+        pass
+
+    if kind == "email":
+        try:
+            resp = await client.users_lookupByEmail(email=query)
+        except SlackApiError as exc:
+            err = None
+            r = getattr(exc, "response", None)
+            if r is not None:
+                try:
+                    err = r.get("error")
+                except Exception:
+                    err = None
+            if err == "missing_scope":
+                return "", _error(
+                    "Slack user email lookup requires the users:read.email scope. "
+                    "Update the Slack app manifest, reinstall the app, and refresh SLACK_BOT_TOKEN."
+                )
+            if err == "users_not_found":
+                return "", _error(f"No Slack user found with email {query}")
+            return "", _error(f"Slack users.lookupByEmail error: {err or exc}")
+
+        user = resp.get("user") if hasattr(resp, "get") else None
+        if not isinstance(user, dict) or not user.get("id"):
+            return "", _error(f"Slack users.lookupByEmail returned no usable user for {query}")
+        if user.get("deleted"):
+            return "", _error(f"Slack user for {query} is deactivated")
+        return user["id"], None
+
+    if kind != "query":
+        return "", _error(f"Unsupported Slack user lookup kind: {kind}")
+
+    query_norm = _normalize_slack_user_query(query)
+    if not query_norm:
+        return "", _error("Slack user lookup query was empty")
+
+    exact_matches: "list[dict]" = []
+    partial_matches: "list[dict]" = []
+    cursor = None
+    try:
+        for _page in range(50):
+            kwargs = {"limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = await client.users_list(**kwargs)
+            members = resp.get("members", []) if hasattr(resp, "get") else []
+            for member in members:
+                if member.get("deleted") or member.get("is_bot"):
+                    continue
+                fields = _slack_user_match_fields(member)
+                normalized = [_normalize_slack_user_query(field) for field in fields]
+                if any(field == query_norm for field in normalized):
+                    exact_matches.append(member)
+                elif any(query_norm in field for field in normalized):
+                    partial_matches.append(member)
+
+            metadata = resp.get("response_metadata", {}) if hasattr(resp, "get") else {}
+            cursor = (metadata or {}).get("next_cursor")
+            if not cursor:
+                break
+    except SlackApiError as exc:
+        err = None
+        r = getattr(exc, "response", None)
+        if r is not None:
+            try:
+                err = r.get("error")
+            except Exception:
+                err = None
+        return "", _error(f"Slack users.list error: {err or exc}")
+
+    matches = exact_matches or partial_matches
+    # Deduplicate by Slack user ID while preserving order.
+    deduped: "list[dict]" = []
+    seen: "set[str]" = set()
+    for member in matches:
+        user_id = member.get("id")
+        if not user_id or user_id in seen:
+            continue
+        seen.add(user_id)
+        deduped.append(member)
+
+    if len(deduped) == 1:
+        return deduped[0]["id"], None
+    if not deduped:
+        return "", _error(f"No Slack user matched '{query}'")
+
+    candidates = "; ".join(_format_slack_user_candidate(member) for member in deduped[:8])
+    return "", _error(
+        f"Ambiguous Slack user target '{query}'. Matches: {candidates}. "
+        "Use slack:U... or slack:email:user@example.com."
+    )
 
 
 def _describe_media_for_mirror(media_files):
@@ -932,11 +1188,36 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Slack: native media attachment support via the registry's
+    # standalone_sender_fn (plugins/platforms/slack/adapter.py::_standalone_send),
+    # which uploads each file with files_upload_v2 so images/PDFs arrive as
+    # native attachments instead of being dropped with a "MEDIA omitted"
+    # warning. Fork patch — see PATCHES.md.
+    if platform == Platform.SLACK and media_files:
+        from gateway.platform_registry import platform_registry as _pr_slack
+        _slack_media_entry = _pr_slack.get("slack")
+        if _slack_media_entry is None or _slack_media_entry.standalone_sender_fn is None:
+            return {"error": "Slack plugin not registered or missing standalone_sender_fn"}
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _slack_media_entry.standalone_sender_fn(
+                pconfig,
+                chat_id,
+                chunk,
+                media_files=media_files if is_last else None,
+                thread_id=thread_id,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and whatsapp; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, slack, weixin, signal, yuanbao, feishu and whatsapp; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -944,7 +1225,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and whatsapp"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, slack, weixin, signal, yuanbao, feishu and whatsapp"
         )
 
     last_result = None

@@ -1636,13 +1636,14 @@ class TestParseTargetRefSlack:
     def test_dm_id_is_explicit(self):
         assert _parse_target_ref("slack", "D123ABCDEF")[2] is True
 
-    def test_user_id_is_not_explicit(self):
-        """Slack user IDs (U...) and workspace IDs (W...) are NOT explicit send
-        targets. chat.postMessage rejects them — a DM must be opened first via
-        conversations.open to obtain a D... conversation ID.
+    def test_user_id_is_explicit(self):
+        """Fork patch (see PATCHES.md): Slack user IDs (U...) and workspace user
+        IDs (W...) are accepted as explicit send targets. _handle_send opens a
+        DM via conversations.open to obtain a D... conversation ID before
+        chat.postMessage / files_upload_v2 run.
         """
-        assert _parse_target_ref("slack", "U123ABCDEF")[2] is False
-        assert _parse_target_ref("slack", "W123ABCDEF")[2] is False
+        assert _parse_target_ref("slack", "U123ABCDEF") == ("U123ABCDEF", None, True)
+        assert _parse_target_ref("slack", "W123ABCDEF") == ("W123ABCDEF", None, True)
 
     def test_whitespace_is_stripped(self):
         chat_id, _, is_explicit = _parse_target_ref("slack", "  C0B0QV5434G  ")
@@ -1692,7 +1693,18 @@ class TestParseTargetRefEmail:
     def test_email_not_explicit_for_other_platforms(self):
         assert _parse_target_ref("telegram", "user@example.com")[2] is False
         assert _parse_target_ref("discord", "user@example.com")[2] is False
-        assert _parse_target_ref("slack", "user@example.com")[2] is False
+
+    def test_email_is_explicit_user_lookup_for_slack(self):
+        """Fork patch (see PATCHES.md): a Slack email target is explicit and is
+        encoded as a synthetic user-lookup that _handle_send resolves to a U-id
+        via users.lookupByEmail before opening the DM."""
+        from tools.send_message_tool import _decode_slack_user_lookup, _is_slack_user_lookup
+
+        chat_id, thread_id, is_explicit = _parse_target_ref("slack", "user@example.com")
+        assert is_explicit is True
+        assert thread_id is None
+        assert _is_slack_user_lookup(chat_id)
+        assert _decode_slack_user_lookup(chat_id) == ("email", "user@example.com")
 
 
 class TestEmailHomeChannelErrorHint:

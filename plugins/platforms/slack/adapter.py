@@ -4329,6 +4329,79 @@ async def _standalone_send(
                 exc_info=True,
             )
 
+    # --- Media attachments: upload natively via files_upload_v2 (fork patch;
+    # see PATCHES.md). Text-only sends fall through to chat.postMessage below.
+    # Each file is uploaded with the slack_sdk async client (matching
+    # SlackAdapter.send_image_file/send_document) so cross-channel and DM sends
+    # through the send_message tool deliver attachments instead of dropping
+    # them with the "MEDIA attachments were omitted" warning.
+    if media_files:
+        try:
+            from slack_sdk.web.async_client import AsyncWebClient
+            from slack_sdk.errors import SlackApiError
+        except ImportError:
+            return {"error": "slack_sdk not installed. Run: pip install 'hermes-agent[slack]'"}
+
+        client = AsyncWebClient(token=token)
+        # Apply the same NO_PROXY-aware proxy the live adapter uses; without it
+        # uploads fail in proxied environments even though text chat.postMessage
+        # (which goes through resolve_proxy_url) works.
+        try:
+            _slack_proxy = _resolve_slack_proxy_url()
+            if _slack_proxy:
+                _apply_slack_proxy(client, _slack_proxy)
+        except Exception:
+            pass
+
+        last_result = None
+        text_consumed = False
+        try:
+            for media_entry in media_files:
+                # media_files items are (path, is_voice) tuples.
+                media_path = media_entry[0] if isinstance(media_entry, (tuple, list)) else media_entry
+                if not media_path or not os.path.exists(media_path):
+                    return {"error": f"Media file not found: {media_path}"}
+
+                initial_comment = "" if text_consumed else (formatted or "")
+                upload_kwargs = {
+                    "channel": chat_id,
+                    "file": media_path,
+                    "filename": os.path.basename(media_path),
+                    "initial_comment": initial_comment,
+                }
+                if thread_id:
+                    upload_kwargs["thread_ts"] = thread_id
+                try:
+                    result = await client.files_upload_v2(**upload_kwargs)
+                except SlackApiError as exc:
+                    resp = getattr(exc, "response", None)
+                    err = None
+                    if resp is not None:
+                        try:
+                            err = resp.get("error")
+                        except Exception:
+                            err = None
+                    return {"error": f"Slack files_upload_v2 error: {err or exc}"}
+
+                text_consumed = True
+                msg_id = None
+                try:
+                    files_list = result.get("files") or []
+                except Exception:
+                    files_list = []
+                if files_list and isinstance(files_list[0], dict):
+                    msg_id = files_list[0].get("id")
+                last_result = {
+                    "success": True,
+                    "platform": "slack",
+                    "chat_id": chat_id,
+                    "message_id": msg_id,
+                }
+
+            return last_result or {"success": True, "platform": "slack", "chat_id": chat_id}
+        except Exception as e:
+            return {"error": f"Slack send failed: {e}"}
+
     try:
         import aiohttp
     except ImportError:
