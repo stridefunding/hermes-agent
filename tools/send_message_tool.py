@@ -2062,16 +2062,23 @@ async def _send_yuanbao(chat_id, message, media_files=None):
 
 
 # --- Registry ---
-from tools.registry import tool_error
+from tools.registry import tool_error, registry
 
-# NOTE: ``send_message`` is intentionally NOT registered as an agent-callable
-# model tool. The agent should not decide on its own to fire off cross-platform
-# messages or reactions. The send engine in this module (``_send_to_platform``,
+# ``send_message`` is registered as an agent-callable tool so the model can
+# forward results to a connected messaging platform (e.g. post research to a
+# Slack channel) from within a session. It is gated by ``_check_send_message``
+# (gateway running, or a kanban worker) and lives in the ``messaging`` toolset —
+# so it never appears in bare CLI/cron schemas, only where a live platform can
+# actually route the send. The same send engine (``_send_to_platform``,
 # ``_send_via_adapter``, ``_parse_target_ref``, the per-platform ``_send_*``
-# helpers) remains the shared transport used by:
-#   - cron delivery (cron/scheduler.py)
-#   - the ``hermes send`` CLI command (hermes_cli/send_cmd.py)
-#   - the gateway kanban notifier (dashboard-toggled, outside agent control)
-#   - the standalone MCP server (mcp_serve.py), which is an opt-in surface
-# Those callers import the helpers directly; none of them need the registry
-# entry.
+# helpers) is still imported directly by cron delivery (cron/scheduler.py), the
+# ``hermes send`` CLI (hermes_cli/send_cmd.py), the gateway kanban notifier, and
+# the standalone MCP server (mcp_serve.py).
+registry.register(
+    name="send_message",
+    toolset="messaging",
+    schema=SEND_MESSAGE_SCHEMA,
+    handler=send_message_tool,
+    check_fn=_check_send_message,
+    emoji="\U0001F4E4",  # 📤
+)

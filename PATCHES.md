@@ -79,3 +79,19 @@ uv run pytest tests/tools/test_send_message_tool.py
   without manual DM setup.
 - **Drop when:** Upstream `send_message` can resolve Slack users and send
   text/media to the resulting DM.
+
+### 4. Register `send_message` as an agent-callable tool
+
+- **What it does:** Registers the existing `send_message` tool in the registry
+  (`tools/send_message_tool.py`) and adds a `messaging` toolset (`toolsets.py`,
+  plus `send_message` in `_HERMES_CORE_TOOLS`), so the model can post to a
+  connected messaging platform (e.g. forward a result to a Slack channel) from
+  within a session. Upstream ships the schema, handler, and `_check_send_message`
+  gate but intentionally leaves it unregistered.
+- **Where it lives now:** `tools/send_message_tool.py` (the `# --- Registry ---`
+  block) and `toolsets.py` (`messaging` toolset + core-tools entry).
+- **Gating:** `_check_send_message` restricts it to live-gateway / kanban-worker
+  sessions, so it never appears in bare CLI/cron schemas.
+- **Why we carry it:** Agents running as a gateway bot should be able to forward
+  their own results to a channel without a human relaying them.
+- **Drop when:** Upstream registers `send_message` as an agent tool.

@@ -63,6 +63,11 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # Cross-platform messaging. Lets the agent post to a connected messaging
+    # platform (e.g. forward a result to a Slack channel) from within a session.
+    # Gated via check_fn (tools/send_message_tool.py::_check_send_message) so it
+    # only appears in live-gateway / kanban-worker sessions, never bare CLI.
+    "send_message",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -209,6 +214,12 @@ TOOLSETS = {
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
         "tools": ["memory"],
+        "includes": []
+    },
+
+    "messaging": {
+        "description": "Send messages to connected messaging platforms (e.g. post a result to a Slack channel). Gated to live-gateway sessions.",
+        "tools": ["send_message"],
         "includes": []
     },
 
