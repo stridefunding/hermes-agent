@@ -359,10 +359,11 @@ async def _registry_standalone_send(platform_name, pconfig, chat_id, message, th
 
 
 async def _resolve_slack_user_target(token, chat_id):
-    """Resolve ``user:U...`` / ``user_name:<handle>`` to a D... DM conversation (chat.postMessage
-    needs a conversation ID); ``user_name:`` goes through users.list first (stable handle match
-    only); other ids pass through. ``(chat_id, None)`` or ``(None, error_dict)``."""
-    if not (chat_id.startswith("user:") or chat_id.startswith("user_name:")):
+    """Resolve ``user:U...`` / ``user_name:<handle>`` / ``user_email:<address>`` to a D... DM
+    conversation (chat.postMessage needs a conversation ID); ``user_name:`` goes through users.list
+    first (stable handle match only), ``user_email:`` through users.lookupByEmail (needs the
+    ``users:read.email`` scope); other ids pass through. ``(chat_id, None)`` or ``(None, error_dict)``."""
+    if not chat_id.startswith(("user:", "user_name:", "user_email:")):
         return chat_id, None
     try:
         import aiohttp
@@ -379,7 +380,24 @@ async def _resolve_slack_user_target(token, chat_id):
                                         **_req_kw) as resp:
                     return await resp.json()
 
-            if chat_id.startswith("user_name:"):
+            if chat_id.startswith("user_email:"):
+                email = chat_id[len("user_email:"):].strip()
+                found = await post_api("users.lookupByEmail", {"email": email})
+                if not found.get("ok"):
+                    err = found.get("error", "unknown")
+                    if err == "missing_scope":
+                        return None, _error("Slack email lookup requires the users:read.email scope. Add it to the "
+                                            "app manifest, reinstall the app, and refresh the bot token.")
+                    if err == "users_not_found":
+                        return None, _error(f"No Slack user found with email {email}")
+                    return None, _error(f"Slack users.lookupByEmail error: {err}")
+                member = found.get("user") or {}
+                if not member.get("id"):
+                    return None, _error(f"Slack users.lookupByEmail returned no usable user for {email}")
+                if member.get("deleted") or member.get("is_bot"):
+                    return None, _error(f"Slack user for {email} is deactivated or a bot")
+                chat_id = f"user:{member['id']}"
+            elif chat_id.startswith("user_name:"):
                 name = chat_id[len("user_name:"):]
                 query = name.strip().lstrip("@").lower()
                 matches, cursor = [], None

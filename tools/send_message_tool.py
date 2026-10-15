@@ -21,9 +21,65 @@ from tools.send_message_senders import (
     _send_matrix_via_adapter, _send_qqbot, _send_signal, _send_telegram, _send_weixin, _send_yuanbao)
 from tools.registry import tool_error
 
-# NOTE: ``send_message`` is intentionally NOT registered as an agent-callable model tool
-# (the agent must not fire cross-platform messages on its own); cron delivery, the
-# ``hermes send`` CLI, the kanban notifier and the opt-in MCP server import the helpers.
+# ``send_message`` is registered as an agent-callable tool at the bottom of this file (fork patch,
+# see PATCHES.md), gated by ``_check_send_message`` and placed in the ``messaging`` toolset.
+# Cron delivery, the ``hermes send`` CLI, the kanban notifier and the opt-in MCP server import the
+# helpers directly.
+
+SEND_MESSAGE_SCHEMA = {
+    "name": "send_message",
+    "description": (
+        "Send a message to a connected messaging platform, or list available targets.\n\n"
+        "IMPORTANT: When the user asks to send to a specific channel or person "
+        "(not just a bare platform name), call send_message(action='list') FIRST to see "
+        "available targets, then send to the correct one.\n"
+        "For Slack users who are not listed targets, you may send directly to "
+        "slack:U..., slack:email:user@example.com or slack:@handle; the user is resolved "
+        "and a DM is opened.\n"
+        "If the user just says a platform name like 'send to telegram', send directly "
+        "to the home channel without listing first."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["send", "list", "react", "unreact"],
+                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (platforms that support it). 'unreact' retracts a previously-added reaction.",
+            },
+            "target": {
+                "type": "string",
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id'. Slack also supports user targets: 'slack:U...', 'slack:email:user@example.com', 'slack:@handle'. Examples: 'telegram', 'discord:#bot-home', 'slack:#engineering', 'slack:email:recipient@example.test'.",
+            },
+            "message": {
+                "type": "string",
+                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment.",
+            },
+            "emoji": {
+                "type": "string",
+                "description": "For action='react': the emoji to react with.",
+            },
+            "message_id": {
+                "type": "string",
+                "description": "For action='react'/'unreact': id of the message to react to. Omit to target the most recent message received in that chat.",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+def _check_send_message():
+    """Gate send_message on a live (non-local) platform session or a kanban worker.
+
+    Kanban workers run under the assignee profile's ``HERMES_HOME``, so the dispatcher's
+    ``HERMES_KANBAN_TASK`` env var is honored explicitly. Bare CLI and cron sessions have neither
+    and never see the tool."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return True
+    from gateway.session_context import get_session_env
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    return bool(platform and platform != "local")
 
 
 def prepare_send_message_platforms() -> None:
@@ -411,8 +467,8 @@ def _home_chat_id(config, platform, platform_name):
 def _slack_dm_chat_id(pconfig, chat_id):
     """Open Slack user targets (``user:``/``user_name:`` from the parser, or a bare U... id from
     session metadata / home-channel config) as DM conversations. ``(chat_id, None)`` or ``(None, error_dict)``."""
-    dm_target = f"user:{chat_id}" if chat_id.startswith("U") and _SLACK_USER_ID_RE.fullmatch(chat_id) else chat_id
-    if not dm_target.startswith(("user:", "user_name:")):
+    dm_target = f"user:{chat_id}" if _SLACK_USER_ID_RE.fullmatch(chat_id) else chat_id
+    if not dm_target.startswith(("user:", "user_name:", "user_email:")):
         return chat_id, None
     from model_tools import _run_async
     return _run_async(_resolve_slack_user_target(pconfig.token, dm_target))
@@ -763,3 +819,16 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             and not last_result.get("media_delivered")):
         last_result["warnings"] = [*last_result.get("warnings", []), warning]
     return last_result
+
+
+# --- Registry ---
+from tools.registry import registry
+
+registry.register(
+    name="send_message",
+    toolset="messaging",
+    schema=SEND_MESSAGE_SCHEMA,
+    handler=send_message_tool,
+    check_fn=_check_send_message,
+    emoji="\U0001F4E4",
+)

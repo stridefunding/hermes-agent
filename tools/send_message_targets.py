@@ -12,7 +12,9 @@ _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::(
 # (U...) become ``user:U...`` and are opened as D... conversations first (posting straight to a U/W
 # id fails); ``@handle`` -> ``user_name:...`` resolves via users.list.
 _SLACK_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,})\s*$")
-_SLACK_USER_ID_RE = re.compile(r"^\s*(U[A-Z0-9]{8,})\s*$")
+_SLACK_USER_ID_RE = re.compile(r"^\s*([UW][A-Z0-9]{8,})\s*$")  # U = member, W = Enterprise Grid member
+# ``email:a@b.c`` / ``mailto:a@b.c`` / a bare address -> users.lookupByEmail (unique, unlike display names).
+_SLACK_EMAIL_RE = re.compile(r"^\s*(?:(?:email|mailto):\s*)?([^@\s:<>]+@[^@\s:<>]+\.[^@\s:<>]+)\s*$", re.IGNORECASE)
 _SLACK_USER_NAME_RE = re.compile(r"^\s*@([A-Za-z0-9._-]{1,80})\s*$")
 _SLACK_MENTION_RE = re.compile(r"^\s*<@(U[A-Z0-9]{8,})(?:\|[^>]+)?>\s*$")
 # Session-derived Slack thread targets use "<conversation_id>:<thread_ts>".
@@ -66,7 +68,8 @@ def _parse_telegram(ref):
 # (regex, chat_id template, thread comes from group 2) — thread form before bare id.
 _SLACK_FORMS = ((_SLACK_THREAD_TARGET_RE, "{}", True), (_SLACK_TARGET_RE, "{}", False),
                 (_SLACK_USER_ID_RE, "user:{}", False), (_SLACK_MENTION_RE, "user:{}", False),
-                (_SLACK_USER_NAME_RE, "user_name:{}", False))
+                (_SLACK_USER_NAME_RE, "user_name:{}", False),
+                (_SLACK_EMAIL_RE, "user_email:{}", False))
 
 
 def _parse_slack(ref):

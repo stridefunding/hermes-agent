@@ -25,6 +25,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     "clarify",
     "execute_code", "delegate_task",
+    # Gated by tools/send_message_tool.py::_check_send_message (live platform session or kanban worker).
+    "send_message",
     "cronjob_manage",
     "kanban_show", "kanban_list",
     "kanban_complete", "kanban_block", "kanban_request_review",
@@ -98,6 +100,11 @@ TOOLSETS = {
         "screenshots, mouse, keyboard, scroll, drag. Does NOT steal the user's cursor "
         "or keyboard focus. Works with any tool-capable model.",
         ["computer_use"],
+    ),
+    "messaging": _ts(
+        "Send messages to connected messaging platforms (e.g. post a result to a Slack channel). "
+        "Gated to live platform sessions.",
+        ["send_message"],
     ),
     "terminal": _ts("Terminal/command execution and process management tools", ["terminal", "process_manage"]),
     "skills": _ts(
