@@ -375,14 +375,17 @@ async def _resolve_slack_user_target(token, chat_id):
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(resolve_proxy_url())
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
-            async def post_api(method, payload):
-                async with session.post(f"https://slack.com/api/{method}", headers=headers, json=payload,
+            async def post_api(method, payload, *, form=False):
+                # users.lookupByEmail rejects JSON bodies (invalid_arguments); it needs form encoding.
+                body = ({"data": payload}, {"Authorization": headers["Authorization"]}) if form \
+                    else ({"json": payload}, headers)
+                async with session.post(f"https://slack.com/api/{method}", headers=body[1], **body[0],
                                         **_req_kw) as resp:
                     return await resp.json()
 
             if chat_id.startswith("user_email:"):
                 email = chat_id[len("user_email:"):].strip()
-                found = await post_api("users.lookupByEmail", {"email": email})
+                found = await post_api("users.lookupByEmail", {"email": email}, form=True)
                 if not found.get("ok"):
                     err = found.get("error", "unknown")
                     if err == "missing_scope":

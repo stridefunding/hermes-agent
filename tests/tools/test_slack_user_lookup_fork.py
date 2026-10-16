@@ -70,7 +70,11 @@ class TestEmailResolution:
         assert (chat_id, err) == ("D0RECIPIENT", None)
         methods = [call.args[0].rsplit("/", 1)[1] for call in session.post.call_args_list]
         assert methods == ["users.lookupByEmail", "conversations.open"]
-        assert session.post.call_args_list[0].kwargs["json"] == {"email": "recipient@example.test"}
+        lookup_kwargs = session.post.call_args_list[0].kwargs
+        # users.lookupByEmail only accepts form-encoded params; a JSON body returns invalid_arguments.
+        assert lookup_kwargs["data"] == {"email": "recipient@example.test"}
+        assert "json" not in lookup_kwargs
+        assert "Content-Type" not in lookup_kwargs["headers"]
         assert session.post.call_args_list[1].kwargs["json"] == {"users": "U0RECIPIENT"}
 
     def test_grid_user_id_opens_dm(self):
